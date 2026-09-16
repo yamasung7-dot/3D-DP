@@ -1,20 +1,25 @@
 BBPlugin.register('3d_dp', {
-    title: '3D DP',
+    title: '3D DP — Depth Parallax',
     author: 'Yama Sung',
-    description: 'Creates physical layered depth parallax geometry from textures or selected base cubes, for Minecraft and generic Blockbench models.',
-    version: '0.6.0',
+    icon: 'view_in_ar',
+    description: 'Creates physical layered depth-parallax geometry from textures or selected base cubes, with depth and PBR map tools.',
+    version: '0.7.0',
     variant: 'both',
     min_version: '4.10.0',
     onload() {
         try {
             this.action = new Action('3d_dp_generate', {
-                name: 'Generate 3D Depth Parallax', icon: 'view_in_ar', category: 'edit',
+                name: '3D DP — Generate Depth Parallax', icon: 'view_in_ar', category: 'edit',
                 click: () => safeOpenDialog()
             });
             this.depth_action = new Action('3d_dp_maps', {
-                name: 'Create 3D DP Depth & PBR Maps', icon: 'texture', category: 'edit',
+                name: '3D DP — Create Depth & PBR Maps', icon: 'texture', category: 'edit',
                 click: () => safeOpenMapDialog()
             });
+            if (MenuBar && MenuBar.menus && MenuBar.menus.tools) {
+                MenuBar.menus.tools.addAction(this.action);
+                MenuBar.menus.tools.addAction(this.depth_action);
+            }
         } catch (e) { console.error('[3D DP] action setup failed', e); }
         this.dialog = null; this.map_dialog = null; this.depth_texture = null;
         this.source_texture = null; this.pbr_textures = []; this.settings = {};
