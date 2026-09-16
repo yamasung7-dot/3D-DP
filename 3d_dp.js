@@ -2,7 +2,7 @@ BBPlugin.register('3d_dp', {
     title: '3D DP',
     author: 'Yama Sung',
     description: 'Creates physical layered depth parallax geometry from textures or selected base cubes, for Minecraft and generic Blockbench models.',
-    version: '0.3.1',
+    version: '0.5.0',
     variant: 'both',
     min_version: '4.10.0',
 
@@ -10,14 +10,14 @@ BBPlugin.register('3d_dp', {
         try {
             this.action = new Action('3d_dp_generate', {
                 name: 'Generate 3D Depth Parallax',
-                description: 'Generate physical layered parallax geometry using the original texture plus a grayscale depth scale.',
+                description: 'Generate physical layered parallax geometry from the original color texture and depth controls.',
                 icon: 'view_in_ar',
                 category: 'edit',
                 click: () => safeOpenDialog(),
             });
             this.depth_action = new Action('3d_dp_maps', {
                 name: 'Create 3D DP Depth & PBR Maps',
-                description: 'Turn the selected texture into a precise grayscale depth scale and optional PBR maps.',
+                description: 'Create a grayscale depth scale plus optional normal and packed MER maps.',
                 icon: 'texture',
                 category: 'edit',
                 click: () => safeOpenMapDialog(),
@@ -30,6 +30,7 @@ BBPlugin.register('3d_dp', {
         this.depth_texture = null;
         this.source_texture = null;
         this.pbr_textures = [];
+        this.settings = {};
     },
 
     onunload() {
@@ -38,16 +39,17 @@ BBPlugin.register('3d_dp', {
             if (this.map_dialog) this.map_dialog.delete();
             if (this.action) this.action.delete();
             if (this.depth_action) this.depth_action.delete();
-            this.dialog = null;
-            this.map_dialog = null;
-            this.action = null;
-            this.depth_action = null;
-            this.depth_texture = null;
-            this.source_texture = null;
-            this.pbr_textures = [];
         } catch (error) {
             console.error('[3D DP] Failed during unload:', error);
         }
+        this.dialog = null;
+        this.map_dialog = null;
+        this.action = null;
+        this.depth_action = null;
+        this.depth_texture = null;
+        this.source_texture = null;
+        this.pbr_textures = [];
+        this.settings = {};
     },
 
     action: null,
@@ -57,6 +59,7 @@ BBPlugin.register('3d_dp', {
     depth_texture: null,
     source_texture: null,
     pbr_textures: [],
+    settings: {},
 });
 
 const DIRECTIONS = ['north', 'south', 'east', 'west', 'up', 'down'];
@@ -64,6 +67,8 @@ const EPSILON = 1e-6;
 const SURFACE_THICKNESS = 0.01;
 const MOBILE_MAX_CUBES = 4096;
 const DESKTOP_MAX_CUBES = 16384;
+const MOBILE_MAX_MAP_PIXELS = 262144;
+const DESKTOP_MAX_MAP_PIXELS = 1048576;
 
 function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
@@ -81,12 +86,18 @@ function getPlugin() {
     return Plugins.registered['3d_dp'];
 }
 
+function showError(message) {
+    if (typeof Blockbench !== 'undefined' && Blockbench.showMessageBox) {
+        Blockbench.showMessageBox({ title: '3D DP', message, icon: 'error' });
+    }
+}
+
 function safeOpenDialog() {
     try {
         openDialog();
     } catch (error) {
         console.error('[3D DP] Dialog error:', error);
-        showError('3D DP could not open its tool window. The plugin is still loaded safely. Try reloading the plugin.');
+        showError('3D DP could not open its tool window. Try reloading the plugin.');
     }
 }
 
@@ -95,13 +106,7 @@ function safeOpenMapDialog() {
         openMapDialog();
     } catch (error) {
         console.error('[3D DP] Map dialog error:', error);
-        showError('3D DP could not open the depth-map tool. The plugin is still loaded safely. Try reloading the plugin.');
-    }
-}
-
-function showError(message) {
-    if (typeof Blockbench !== 'undefined' && Blockbench.showMessageBox) {
-        Blockbench.showMessageBox({ title: '3D DP', message, icon: 'error' });
+        showError('3D DP could not open the depth-map tool. Try reloading the plugin.');
     }
 }
 
@@ -141,27 +146,33 @@ function getPixelData(texture) {
 }
 
 function getLuminance(r, g, b) {
-    // Rec. 709 luminance gives the depth tool a continuous 0..1 grayscale scale.
     return ((0.2126 * r) + (0.7152 * g) + (0.0722 * b)) / 255;
 }
 
-function getDepthFromNormalized(normalized, maxOutward, maxInward) {
-    return (normalized * maxOutward) - ((1 - normalized) * maxInward);
+function applyDepthCurve(value, curve, midpoint) {
+    value = clamp(value, 0, 1);
+    midpoint = clamp(midpoint, 0.001, 0.999);
+    if (curve === 'soft') value = Math.sqrt(value);
+    if (curve === 'strong') value = value * value;
+    if (curve === 'contrast') value = value < 0.5 ? value * 0.5 : 0.5 + (value - 0.5) * 1.5;
+    if (value >= midpoint) return 0.5 + ((value - midpoint) / (1 - midpoint)) * 0.5;
+    return ((value / midpoint) * 0.5);
 }
 
-function getDepthFromPixel(r, g, b, maxOutward, maxInward) {
-    return getDepthFromNormalized(getLuminance(r, g, b), maxOutward, maxInward);
+function getDepthFromNormalized(normalized, maxOutward, maxInward, curve, midpoint) {
+    const centered = applyDepthCurve(normalized, curve, midpoint);
+    return (centered * maxOutward) - ((1 - centered) * maxInward);
 }
 
-function makeUV(u, v) {
-    return [u, v, u + 1, v + 1];
+function makeUV(u, v, w, h) {
+    return [u, v, u + w, v + h];
 }
 
-function makePixelCube(x, y, zFrom, zTo, cellW, cellH, uvX, uvY, texture, group, name) {
+function makePixelCube(x, y, zFrom, zTo, cellW, cellH, uvX, uvY, uvW, uvH, texture, group, name) {
     let minZ = Math.min(zFrom, zTo);
     let maxZ = Math.max(zFrom, zTo);
     if (maxZ - minZ < SURFACE_THICKNESS) maxZ = minZ + SURFACE_THICKNESS;
-    const uvs = makeUV(uvX, uvY);
+    const uvs = makeUV(uvX, uvY, uvW, uvH);
     const faces = {};
     for (const direction of DIRECTIONS) {
         faces[direction] = { uv: [...uvs], texture, rotation: 0, enabled: true };
@@ -186,36 +197,50 @@ function sameRange(a0, a1, b0, b1) {
     return sameNumber(a0, b0) && sameNumber(a1, b1);
 }
 
-function optimizeHiddenFaces(cubes) {
-    const grid = new Map();
-    for (const item of cubes) grid.set(item.key, item.cube);
-    let disabled = 0;
-
-    function disableIfCovered(cube, direction, neighbor) {
-        if (!neighbor) return;
-        let covered = false;
-        if (direction === 'east') {
-            covered = sameNumber(cube.to[0], neighbor.from[0]) && sameRange(cube.from[1], cube.to[1], neighbor.from[1], neighbor.to[1]) && sameRange(cube.from[2], cube.to[2], neighbor.from[2], neighbor.to[2]);
-        } else if (direction === 'west') {
-            covered = sameNumber(cube.from[0], neighbor.to[0]) && sameRange(cube.from[1], cube.to[1], neighbor.from[1], neighbor.to[1]) && sameRange(cube.from[2], cube.to[2], neighbor.from[2], neighbor.to[2]);
-        } else if (direction === 'up') {
-            covered = sameNumber(cube.from[1], neighbor.to[1]) && sameRange(cube.from[0], cube.to[0], neighbor.from[0], neighbor.to[0]) && sameRange(cube.from[2], cube.to[2], neighbor.from[2], neighbor.to[2]);
-        } else if (direction === 'down') {
-            covered = sameNumber(cube.to[1], neighbor.from[1]) && sameRange(cube.from[0], cube.to[0], neighbor.from[0], neighbor.to[0]) && sameRange(cube.from[2], cube.to[2], neighbor.from[2], neighbor.to[2]);
-        }
-        if (covered && cube.faces[direction].enabled) {
-            cube.faces[direction].enabled = false;
-            disabled++;
-        }
+function rectangleCovered(intervals, start, end) {
+    if (end <= start + EPSILON) return true;
+    intervals.sort((a, b) => a[0] - b[0]);
+    let cursor = start;
+    for (const interval of intervals) {
+        if (interval[1] <= cursor + EPSILON) continue;
+        if (interval[0] > cursor + EPSILON) return false;
+        cursor = Math.max(cursor, interval[1]);
+        if (cursor >= end - EPSILON) return true;
     }
+    return cursor >= end - EPSILON;
+}
 
+function optimizeHiddenFaces(cubes) {
+    const maps = { east: new Map(), west: new Map(), up: new Map(), down: new Map() };
+    function add(map, key, item, start, end) {
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push([start, end, item]);
+    }
     for (const item of cubes) {
-        const [x, y] = item.key.split(',').map(Number);
-        const cube = item.cube;
-        disableIfCovered(cube, 'east', grid.get(`${x + 1},${y}`));
-        disableIfCovered(cube, 'west', grid.get(`${x - 1},${y}`));
-        disableIfCovered(cube, 'down', grid.get(`${x},${y + 1}`));
-        disableIfCovered(cube, 'up', grid.get(`${x},${y - 1}`));
+        const c = item.cube;
+        add(maps.east, `${c.to[0]}|${c.from[2]}|${c.to[2]}`, item, c.from[1], c.to[1]);
+        add(maps.west, `${c.from[0]}|${c.from[2]}|${c.to[2]}`, item, c.from[1], c.to[1]);
+        add(maps.up, `${c.from[1]}|${c.from[2]}|${c.to[2]}`, item, c.from[0], c.to[0]);
+        add(maps.down, `${c.to[1]}|${c.from[2]}|${c.to[2]}`, item, c.from[0], c.to[0]);
+    }
+    let disabled = 0;
+    for (const item of cubes) {
+        const c = item.cube;
+        const checks = [
+            ['east', maps.west, c.to[0], c.from[1], c.to[1]],
+            ['west', maps.east, c.from[0], c.from[1], c.to[1]],
+            ['up', maps.down, c.from[1], c.from[0], c.to[0]],
+            ['down', maps.up, c.to[1], c.from[0], c.to[0]],
+        ];
+        for (const [direction, map, plane, start, end] of checks) {
+            const key = `${plane}|${c.from[2]}|${c.to[2]}`;
+            const entries = map.get(key) || [];
+            const intervals = entries.filter(entry => entry[2] !== item).map(entry => [entry[0], entry[1]]);
+            if (rectangleCovered(intervals, start, end) && c.faces[direction].enabled) {
+                c.faces[direction].enabled = false;
+                disabled++;
+            }
+        }
     }
     return disabled;
 }
@@ -227,7 +252,7 @@ function makeTextureFromCanvas(name, canvas, channel) {
     return texture;
 }
 
-function createDepthScaleTexture(width, height, data) {
+function createDepthScaleTexture(width, height, data, settings) {
     const canvas = document.createElement('canvas');
     canvas.width = width;
     canvas.height = height;
@@ -235,17 +260,18 @@ function createDepthScaleTexture(width, height, data) {
     if (!ctx) return null;
     const output = ctx.createImageData(width, height);
     for (let i = 0; i < data.length; i += 4) {
-        const value = Math.round(getLuminance(data[i], data[i + 1], data[i + 2]) * 255);
-        output.data[i] = value;
-        output.data[i + 1] = value;
-        output.data[i + 2] = value;
+        let value = getLuminance(data[i], data[i + 1], data[i + 2]);
+        value = applyDepthCurve(value, settings.curve, settings.midpoint);
+        if (settings.invert) value = 1 - value;
+        const out = Math.round(value * 255);
+        output.data[i] = output.data[i + 1] = output.data[i + 2] = out;
         output.data[i + 3] = data[i + 3];
     }
     ctx.putImageData(output, 0, 0);
     return makeTextureFromCanvas('3D DP Depth Scale', canvas, 'height');
 }
 
-function createPBRMaps(width, height, data) {
+function createPBRMaps(width, height, data, settings) {
     const normalCanvas = document.createElement('canvas');
     const merCanvas = document.createElement('canvas');
     normalCanvas.width = merCanvas.width = width;
@@ -253,17 +279,18 @@ function createPBRMaps(width, height, data) {
     const nctx = normalCanvas.getContext('2d');
     const mctx = merCanvas.getContext('2d');
     if (!nctx || !mctx) return [];
-
     const normal = nctx.createImageData(width, height);
     const mer = mctx.createImageData(width, height);
-
     function sample(px, py) {
         px = clamp(px, 0, width - 1);
         py = clamp(py, 0, height - 1);
         const i = (py * width + px) * 4;
-        return getLuminance(data[i], data[i + 1], data[i + 2]);
+        let v = getLuminance(data[i], data[i + 1], data[i + 2]);
+        v = applyDepthCurve(v, settings.curve, settings.midpoint);
+        if (settings.invert) v = 1 - v;
+        return v;
     }
-
+    const strength = Math.max(0, Number(settings.normal_strength) || 1);
     for (let y = 0; y < height; y++) {
         for (let x = 0; x < width; x++) {
             const i = (y * width + x) * 4;
@@ -271,19 +298,17 @@ function createPBRMaps(width, height, data) {
             const right = sample(x + 1, y);
             const up = sample(x, y - 1);
             const down = sample(x, y + 1);
-            const nx = -(right - left);
-            const ny = -(down - up);
+            const nx = -(right - left) * strength;
+            const ny = -(down - up) * strength;
             const nz = 1;
-            const length = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
-            normal.data[i] = Math.round(((nx / length) * 0.5 + 0.5) * 255);
-            normal.data[i + 1] = Math.round(((ny / length) * 0.5 + 0.5) * 255);
-            normal.data[i + 2] = Math.round(((nz / length) * 0.5 + 0.5) * 255);
+            const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+            normal.data[i] = Math.round(((nx / len) * 0.5 + 0.5) * 255);
+            normal.data[i + 1] = Math.round(((ny / len) * 0.5 + 0.5) * 255);
+            normal.data[i + 2] = Math.round(((nz / len) * 0.5 + 0.5) * 255);
             normal.data[i + 3] = data[i + 3];
-            // MER packing: Red = metallic, Green = emissive, Blue = roughness.
-            // Metallic is deliberately 0 because ordinary color pixels cannot reliably identify metal.
-            mer.data[i] = 0;
-            mer.data[i + 1] = 0;
-            mer.data[i + 2] = 128;
+            mer.data[i] = Math.round(clamp(Number(settings.metallic) || 0, 0, 1) * 255);
+            mer.data[i + 1] = Math.round(clamp(Number(settings.emissive) || 0, 0, 1) * 255);
+            mer.data[i + 2] = Math.round(clamp(Number(settings.roughness) || 0.5, 0, 1) * 255);
             mer.data[i + 3] = data[i + 3];
         }
     }
@@ -295,42 +320,37 @@ function createPBRMaps(width, height, data) {
     ];
 }
 
-function prepareDepthMaps(includePBR) {
+function prepareDepthMaps(form) {
     const source = getSourceTexture(null);
-    if (!source) {
-        showError('Select the original texture first. 3D DP will keep that original texture for the final model.');
-        return;
-    }
+    if (!source) return showError('Select the original color texture first.');
     const pixelData = getPixelData(source.texture);
-    if (!pixelData) {
-        showError('The selected texture could not be read as pixel data.');
-        return;
-    }
-
+    if (!pixelData) return showError('The selected texture could not be read as pixel data.');
     const { width, height, data } = pixelData;
-    if (width * height > (isMobile() ? 262144 : 1048576)) {
-        showError('This texture is too large for the mobile-safe map generator. Use a smaller texture.');
-        return;
+    if (width * height > (isMobile() ? MOBILE_MAX_MAP_PIXELS : DESKTOP_MAX_MAP_PIXELS)) {
+        return showError('This texture is too large for the mobile-safe map generator. Use a smaller texture.');
     }
-
     try {
-        const depthTexture = createDepthScaleTexture(width, height, data);
+        const settings = {
+            curve: form.curve || 'linear',
+            midpoint: Number(form.midpoint) || 0.5,
+            invert: Boolean(form.invert),
+            normal_strength: Number(form.normal_strength) || 1,
+            roughness: Number(form.roughness) || 0.5,
+            metallic: Number(form.metallic) || 0,
+            emissive: Number(form.emissive) || 0,
+        };
+        const depthTexture = createDepthScaleTexture(width, height, data, settings);
         if (!depthTexture) throw new Error('Could not create the depth scale texture.');
         const plugin = getPlugin();
         if (plugin) {
             plugin.depth_texture = depthTexture;
             plugin.source_texture = source.texture;
-            plugin.pbr_textures = [];
+            plugin.settings = settings;
+            plugin.pbr_textures = Boolean(form.pbr) ? createPBRMaps(width, height, data, settings) : [];
         }
-        const created = ['depth scale'];
-        if (includePBR) {
-            const pbrMaps = createPBRMaps(width, height, data);
-            if (plugin) plugin.pbr_textures = pbrMaps;
-            created.push('normal', 'packed MER (metallic/emissive/roughness)');
-        }
-        // Keep the original color texture selected so the workflow naturally switches back to it.
+        const count = Boolean(form.pbr) ? 3 : 1;
         Texture.selected = source.texture;
-        Blockbench.showQuickMessage(`3D DP: created ${created.join(', ')}. Original texture remains the color texture and the grayscale depth scale is stored for generation.`);
+        Blockbench.showQuickMessage(`3D DP: created ${count} map${count === 1 ? '' : 's'}; original color texture remains selected.`);
     } catch (error) {
         console.error('[3D DP] Map generation failed:', error);
         showError(`3D DP could not create the maps: ${error.message || error}`);
@@ -343,100 +363,127 @@ function getDepthTextureForGeneration(sourceTexture, useGeneratedDepth) {
     return null;
 }
 
-function createParallax(maxOutward, maxInward, useGeneratedDepth) {
+function getProjectionTransform(direction, baseCube) {
+    const from = baseCube ? baseCube.from : [0, 0, 0];
+    const to = baseCube ? baseCube.to : [0, 0, 0];
+    switch (direction) {
+        case 'south': return { origin: [0, 0, to[2]], rotation: [0, 0, 0], flipX: false, flipY: false };
+        case 'east': return { origin: [to[0], 0, 0], rotation: [0, 90, 0], flipX: false, flipY: false };
+        case 'west': return { origin: [from[0], 0, 0], rotation: [0, -90, 0], flipX: false, flipY: false };
+        case 'up': return { origin: [0, to[1], 0], rotation: [-90, 0, 0], flipX: false, flipY: false };
+        case 'down': return { origin: [0, from[1], 0], rotation: [90, 0, 0], flipX: false, flipY: false };
+        default: return { origin: [0, 0, from[2]], rotation: [0, 180, 0], flipX: false, flipY: false };
+    }
+}
+
+function createParallax(form) {
     const baseCube = getSelectedBaseCube();
     const source = getSourceTexture(baseCube);
-    if (!source) {
-        showError('Select a texture, or select exactly one cube that has a texture on one of its faces.');
-        return;
-    }
+    if (!source) return showError('Select a texture, or select exactly one textured cube.');
     const pixelData = getPixelData(source.texture);
-    if (!pixelData) {
-        showError('The selected texture could not be read as pixel data.');
-        return;
-    }
-
-    const depthTexture = getDepthTextureForGeneration(source.texture, useGeneratedDepth);
+    if (!pixelData) return showError('The selected texture could not be read as pixel data.');
+    const depthTexture = getDepthTextureForGeneration(source.texture, Boolean(form.use_depth_scale));
     const depthData = depthTexture ? getPixelData(depthTexture) : pixelData;
-    const { width, height, data } = pixelData;
-    if (!depthData || depthData.width !== width || depthData.height !== height) {
-        showError('The generated depth scale does not match the original texture. Create the depth scale again from the same texture.');
-        return;
+    if (!depthData || depthData.width !== pixelData.width || depthData.height !== pixelData.height) {
+        return showError('The stored depth scale does not match the original texture. Create it again from the same texture.');
     }
+    const width = pixelData.width;
+    const height = pixelData.height;
+    const data = pixelData.data;
+    const ddata = depthData.data;
+    const maxOutward = Math.max(0, Number(form.outward) || 0);
+    const maxInward = Math.max(0, Number(form.inward) || 0);
+    const curve = form.curve || 'linear';
+    const midpoint = clamp(Number(form.midpoint) || 0.5, 0.001, 0.999);
+    const merge = Boolean(form.merge);
+    const smooth = Boolean(form.smooth);
+    const threshold = clamp(Number(form.alpha_threshold) || 1, 0, 255);
+    const direction = form.direction === 'auto' ? (source.direction || 'north') : (form.direction || source.direction || 'north');
+    const limit = getCubeLimit();
 
-    const cubeLimit = getCubeLimit();
-    const opaquePixels = [];
-    for (let py = 0; py < height; py++) {
-        for (let px = 0; px < width; px++) {
-            if (data[((py * width + px) * 4) + 3] !== 0) opaquePixels.push([px, py]);
+    const cells = [];
+    const byRow = new Map();
+    for (let y = 0; y < height; y++) {
+        let run = null;
+        for (let x = 0; x < width; x++) {
+            const i = (y * width + x) * 4;
+            if (data[i + 3] < threshold) {
+                if (run) { byRow.set(`${y}:${run.x}`, run); run = null; }
+                continue;
+            }
+            let value = getLuminance(ddata[i], ddata[i + 1], ddata[i + 2]);
+            if (smooth && x > 0 && x < width - 1) {
+                const a = getLuminance(ddata[i - 4], ddata[i - 3], ddata[i - 2]);
+                const b = getLuminance(ddata[i + 4], ddata[i + 5], ddata[i + 6]);
+                value = (value * 2 + a + b) / 4;
+            }
+            const depth = getDepthFromNormalized(value, maxOutward, maxInward, curve, midpoint);
+            if (merge && run && Math.abs(run.depth - depth) <= 0.0001) {
+                run.w++;
+            } else {
+                if (run) cells.push(run);
+                run = { x, y, w: 1, h: 1, depth };
+            }
         }
-    }
-    if (opaquePixels.length > cubeLimit) {
-        Blockbench.showMessageBox({
-            title: '3D DP — Safety Limit',
-            message: `${isMobile() ? 'Mobile' : 'Desktop'} safety limit: this texture would create ${opaquePixels.length} pixel cubes, but the current limit is ${cubeLimit}. No geometry was created.`,
-            icon: 'warning',
-        });
-        return;
+        if (run) cells.push(run);
     }
 
-    let originX = 0;
-    let originY = 0;
-    let baseZ = 0;
-    let cellW = 1;
-    let cellH = 1;
-    if (baseCube) {
-        const cubeWidth = baseCube.to[0] - baseCube.from[0];
-        const cubeHeight = baseCube.to[1] - baseCube.from[1];
-        originX = baseCube.from[0];
-        originY = baseCube.from[1];
-        baseZ = baseCube.from[2];
-        cellW = cubeWidth / width;
-        cellH = cubeHeight / height;
-    } else {
-        originX = -(width / 2);
-        originY = -(height / 2);
-        baseZ = 0;
+    if (merge && cells.length) {
+        const merged = [];
+        const lookup = new Map();
+        for (const cell of cells) lookup.set(`${cell.x},${cell.y}`, cell);
+        const used = new Set();
+        for (const cell of cells) {
+            const key = `${cell.x},${cell.y}`;
+            if (used.has(key)) continue;
+            let h = cell.h;
+            while (true) {
+                let ok = true;
+                for (let x = cell.x; x < cell.x + cell.w; x++) {
+                    const n = lookup.get(`${x},${cell.y + h}`);
+                    if (!n || n.w !== 1 || Math.abs(n.depth - cell.depth) > 0.0001 || used.has(`${x},${cell.y + h}`)) { ok = false; break; }
+                }
+                if (!ok) break;
+                h++;
+            }
+            for (let yy = cell.y; yy < cell.y + h; yy++) {
+                for (let xx = cell.x; xx < cell.x + cell.w; xx++) used.add(`${xx},${yy}`);
+            }
+            merged.push({ x: cell.x, y: cell.y, w: cell.w, h, depth: cell.depth });
+        }
+        cells.length = 0;
+        cells.push(...merged);
     }
 
-    Undo.initEdit({ outliner: true, elements: true, selection: true });
+    if (cells.length > limit) {
+        return showError(`3D DP estimates ${cells.length} geometry layers, above the ${limit}-cube ${isMobile() ? 'mobile' : 'desktop'} safety limit. Enable Merge Similar Depth Regions or use a smaller texture.`);
+    }
+
     let group = null;
     try {
-        group = new Group({
-            name: '3D DP Parallax',
-            origin: [originX, originY, baseZ],
-            rotation: [0, 0, 0],
-            autouv: 0,
-            shade: false,
-            export: true,
-            visibility: true,
-        }).init().addTo('root');
-
-        if (baseCube && source.direction === 'north') baseCube.faces.north.enabled = false;
-
-        const cubes = [];
-        const textureRef = source.texture.uuid || source.texture.id;
-        for (const [px, py] of opaquePixels) {
-            const i = (py * width + px) * 4;
-            const depthValue = getLuminance(depthData.data[i], depthData.data[i + 1], depthData.data[i + 2]);
-            const depth = getDepthFromNormalized(depthValue, maxOutward, maxInward);
-            const z0 = baseZ - Math.max(depth, 0);
-            const z1 = baseZ + Math.max(-depth, 0);
-            const x = originX + (px * cellW);
-            const y = originY + (py * cellH);
-            const cube = makePixelCube(x, y, z0, z1, cellW, cellH, px, py, textureRef, group, `px_${px}_${py}`);
-            cubes.push({ cube, key: `${px},${py}` });
+        Undo.initEdit({ outliner: true, elements: true, selection: true });
+        group = new Group({ name: `3D DP ${source.texture.name || 'Texture'}` }).init().addTo(Panels.outliner.root);
+        const transform = getProjectionTransform(direction, baseCube);
+        group.origin = transform.origin;
+        group.rotation = transform.rotation;
+        const cellW = baseCube ? Math.abs(baseCube.to[0] - baseCube.from[0]) / width : 1;
+        const cellH = baseCube ? Math.abs(baseCube.to[1] - baseCube.from[1]) / height : 1;
+        const zBase = 0;
+        for (let index = 0; index < cells.length; index++) {
+            const cell = cells[index];
+            const cube = makePixelCube(cell.x * cellW, cell.y * cellH, zBase, cell.depth, cell.w * cellW, cell.h * cellH, cell.x, cell.y, cell.w, cell.h, source.texture.uuid || source.texture.id, group, `DP_${index}`);
+            cells[index].cube = cube;
         }
-
-        const disabled = optimizeHiddenFaces(cubes);
+        const disabled = optimizeHiddenFaces(cells);
+        if (baseCube && baseCube.faces[direction]) baseCube.faces[direction].enabled = false;
         group.select();
         Undo.finishEdit('Generate 3D Depth Parallax', { outliner: true, elements: true, selection: true });
-        Blockbench.showQuickMessage(`3D DP: generated ${cubes.length} pixel layers, removed ${disabled} hidden faces, using ${useGeneratedDepth && depthTexture ? 'the stored grayscale depth scale' : 'live grayscale from the original texture'}. Original texture retained.`);
+        Blockbench.showQuickMessage(`3D DP: generated ${cells.length} layers, removed ${disabled} hidden faces, merged=${merge ? 'on' : 'off'}, projection=${direction}.`);
     } catch (error) {
         Undo.cancelEdit(true);
         if (group) group.remove();
-        console.error('[3D DP]', error);
-        showError(String(error && error.message ? error.message : error));
+        console.error('[3D DP] Generation failed:', error);
+        showError(`3D DP could not generate the model: ${error.message || error}`);
     }
 }
 
@@ -444,22 +491,29 @@ function openDialog() {
     const baseCube = getSelectedBaseCube();
     const source = getSourceTexture(baseCube);
     const plugin = getPlugin();
-    const hasDepth = Boolean(plugin && plugin.depth_texture && plugin.source_texture === (source && source.texture));
-    const selectedTextureName = source && source.texture ? source.texture.name : 'No texture selected';
-    const mobileText = isMobile() ? `Android/mobile safety limit: ${MOBILE_MAX_CUBES} pixel cubes.` : `Desktop safety limit: ${DESKTOP_MAX_CUBES} pixel cubes.`;
-    const dialog = new Dialog('3d_dp_dialog', {
-        title: '3D DP — Physical Layered Parallax',
-        width: isMobile() ? 360 : 430,
+    if (plugin && plugin.dialog) plugin.dialog.delete();
+    const saved = plugin ? plugin.settings || {} : {};
+    const name = source && source.texture ? source.texture.name : 'No texture selected';
+    const defaultDirection = source && (source.direction || baseCube) ? (source.direction || 'auto') : 'auto';
+    const dialog = new Dialog({
+        id: '3d_dp_generate_dialog',
+        title: '3D DP — Generate Physical Parallax',
+        width: isMobile() ? 360 : 440,
         form: {
-            max_outward: { type: 'number', label: 'Max Outward Extrusion (pixels)', value: 2, min: 0, max: 16, step: 0.1 },
-            max_inward: { type: 'number', label: 'Max Inward Carving (pixels)', value: 2, min: 0, max: 16, step: 0.1 },
-            use_depth_scale: { type: 'checkbox', label: `Use generated grayscale depth scale${hasDepth ? '' : ' (create one first)'}`, value: hasDepth },
-            source_info: { type: 'info', text: `Original texture: ${selectedTextureName}<br>${mobileText}<br>Bright = outward, dark = inward, mid-gray = base plane.<br>The original color texture is used on the generated geometry.` },
+            outward: { type: 'number', label: 'Max outward depth', value: 4, min: 0, max: 64, step: 0.1 },
+            inward: { type: 'number', label: 'Max inward depth', value: 4, min: 0, max: 64, step: 0.1 },
+            curve: { type: 'select', label: 'Depth curve', options: { linear: 'Linear', soft: 'Soft highlights', strong: 'Strong center', contrast: 'High contrast' }, value: saved.curve || 'linear' },
+            midpoint: { type: 'number', label: 'Midpoint (0–1)', value: saved.midpoint || 0.5, min: 0.05, max: 0.95, step: 0.05 },
+            invert: { type: 'checkbox', label: 'Invert depth', value: Boolean(saved.invert) },
+            smooth: { type: 'checkbox', label: 'Smooth depth sampling', value: true },
+            alpha_threshold: { type: 'number', label: 'Transparency threshold (0–255)', value: 1, min: 0, max: 255, step: 1 },
+            merge: { type: 'checkbox', label: 'Merge equal-depth regions', value: true },
+            direction: { type: 'select', label: 'Projection face', options: { auto: 'Auto / selected face', north: 'North', south: 'South', east: 'East', west: 'West', up: 'Up', down: 'Down' }, value: defaultDirection },
+            use_depth_scale: { type: 'checkbox', label: 'Use stored grayscale depth scale', value: Boolean(plugin && plugin.depth_texture && plugin.source_texture === (source && source.texture)) },
+            info: { type: 'info', text: `Source: ${name}<br><br>Bright pixels become outward depth, dark pixels become inward depth, and transparent pixels are skipped. The original color texture is used on the generated geometry.` },
         },
         onConfirm(form) {
-            const outward = clamp(Number(form.max_outward) || 0, 0, 16);
-            const inward = clamp(Number(form.max_inward) || 0, 0, 16);
-            createParallax(outward, inward, Boolean(form.use_depth_scale));
+            createParallax(form);
         },
     });
     if (plugin) plugin.dialog = dialog;
@@ -468,19 +522,29 @@ function openDialog() {
 
 function openMapDialog() {
     const source = getSourceTexture(null);
+    const plugin = getPlugin();
+    if (plugin && plugin.map_dialog) plugin.map_dialog.delete();
     const name = source && source.texture ? source.texture.name : 'No texture selected';
-    const dialog = new Dialog('3d_dp_maps_dialog', {
+    const saved = plugin ? plugin.settings || {} : {};
+    const dialog = new Dialog({
+        id: '3d_dp_map_dialog',
         title: '3D DP — Depth Scale & PBR Maps',
         width: isMobile() ? 360 : 430,
         form: {
-            pbr: { type: 'checkbox', label: 'Also create Normal + packed MER maps', value: true },
-            info: { type: 'info', text: `Source: ${name}<br><br>3D DP converts the source to a full 256-level grayscale depth scale using Rec. 709 luminance. White is the maximum outward side of the scale, black is the maximum inward side, and middle gray is the base plane.<br><br>The depth map is stored for the generator. Your original color texture remains selected and is used on the final geometry.` },
+            curve: { type: 'select', label: 'Depth curve', options: { linear: 'Linear', soft: 'Soft highlights', strong: 'Strong center', contrast: 'High contrast' }, value: saved.curve || 'linear' },
+            midpoint: { type: 'number', label: 'Midpoint (0–1)', value: saved.midpoint || 0.5, min: 0.05, max: 0.95, step: 0.05 },
+            invert: { type: 'checkbox', label: 'Invert depth scale', value: Boolean(saved.invert) },
+            pbr: { type: 'checkbox', label: 'Also create Normal + packed MER', value: true },
+            normal_strength: { type: 'number', label: 'Normal strength', value: saved.normal_strength || 1, min: 0, max: 8, step: 0.1 },
+            roughness: { type: 'number', label: 'MER roughness (0–1)', value: saved.roughness ?? 0.5, min: 0, max: 1, step: 0.05 },
+            metallic: { type: 'number', label: 'MER metallic (0–1)', value: saved.metallic || 0, min: 0, max: 1, step: 0.05 },
+            emissive: { type: 'number', label: 'MER emissive (0–1)', value: saved.emissive || 0, min: 0, max: 1, step: 0.05 },
+            info: { type: 'info', text: `Source: ${name}<br><br>The depth scale is grayscale and marked as a height map. Normal is generated from its gradient. MER packs metallic, emissive and roughness into one map. The original color texture remains the color texture.` },
         },
         onConfirm(form) {
-            prepareDepthMaps(Boolean(form.pbr));
+            prepareDepthMaps(form);
         },
     });
-    const plugin = getPlugin();
     if (plugin) plugin.map_dialog = dialog;
     dialog.show();
 }
