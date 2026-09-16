@@ -2,7 +2,7 @@ BBPlugin.register('3d_dp', {
     title: '3D DP',
     author: 'Yama Sung',
     description: 'Creates physical layered depth parallax geometry from textures or selected base cubes, for Minecraft and generic Blockbench models.',
-    version: '0.3.0',
+    version: '0.3.1',
     variant: 'both',
     min_version: '4.10.0',
 
@@ -29,6 +29,7 @@ BBPlugin.register('3d_dp', {
         this.map_dialog = null;
         this.depth_texture = null;
         this.source_texture = null;
+        this.pbr_textures = [];
     },
 
     onunload() {
@@ -43,6 +44,7 @@ BBPlugin.register('3d_dp', {
             this.depth_action = null;
             this.depth_texture = null;
             this.source_texture = null;
+            this.pbr_textures = [];
         } catch (error) {
             console.error('[3D DP] Failed during unload:', error);
         }
@@ -54,6 +56,7 @@ BBPlugin.register('3d_dp', {
     map_dialog: null,
     depth_texture: null,
     source_texture: null,
+    pbr_textures: [],
 });
 
 const DIRECTIONS = ['north', 'south', 'east', 'west', 'up', 'down'];
@@ -143,7 +146,6 @@ function getLuminance(r, g, b) {
 }
 
 function getDepthFromNormalized(normalized, maxOutward, maxInward) {
-    // 0 = full inward, 0.5 = base plane, 1 = full outward when both limits match.
     return (normalized * maxOutward) - ((1 - normalized) * maxInward);
 }
 
@@ -245,18 +247,15 @@ function createDepthScaleTexture(width, height, data) {
 
 function createPBRMaps(width, height, data) {
     const normalCanvas = document.createElement('canvas');
-    const roughnessCanvas = document.createElement('canvas');
-    const metallicCanvas = document.createElement('canvas');
-    normalCanvas.width = roughnessCanvas.width = metallicCanvas.width = width;
-    normalCanvas.height = roughnessCanvas.height = metallicCanvas.height = height;
+    const merCanvas = document.createElement('canvas');
+    normalCanvas.width = merCanvas.width = width;
+    normalCanvas.height = merCanvas.height = height;
     const nctx = normalCanvas.getContext('2d');
-    const rctx = roughnessCanvas.getContext('2d');
-    const mctx = metallicCanvas.getContext('2d');
-    if (!nctx || !rctx || !mctx) return [];
+    const mctx = merCanvas.getContext('2d');
+    if (!nctx || !mctx) return [];
 
     const normal = nctx.createImageData(width, height);
-    const roughness = rctx.createImageData(width, height);
-    const metallic = mctx.createImageData(width, height);
+    const mer = mctx.createImageData(width, height);
 
     function sample(px, py) {
         px = clamp(px, 0, width - 1);
@@ -272,30 +271,27 @@ function createPBRMaps(width, height, data) {
             const right = sample(x + 1, y);
             const up = sample(x, y - 1);
             const down = sample(x, y + 1);
-            const dx = right - left;
-            const dy = down - up;
-            const nx = -dx;
-            const ny = -dy;
+            const nx = -(right - left);
+            const ny = -(down - up);
             const nz = 1;
             const length = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
             normal.data[i] = Math.round(((nx / length) * 0.5 + 0.5) * 255);
             normal.data[i + 1] = Math.round(((ny / length) * 0.5 + 0.5) * 255);
             normal.data[i + 2] = Math.round(((nz / length) * 0.5 + 0.5) * 255);
             normal.data[i + 3] = data[i + 3];
-            roughness.data[i] = roughness.data[i + 1] = roughness.data[i + 2] = 128;
-            roughness.data[i + 3] = data[i + 3];
-            // Metallic cannot be inferred reliably from ordinary color pixels, so use a safe non-metal default.
-            metallic.data[i] = metallic.data[i + 1] = metallic.data[i + 2] = 0;
-            metallic.data[i + 3] = data[i + 3];
+            // MER packing: Red = metallic, Green = emissive, Blue = roughness.
+            // Metallic is deliberately 0 because ordinary color pixels cannot reliably identify metal.
+            mer.data[i] = 0;
+            mer.data[i + 1] = 0;
+            mer.data[i + 2] = 128;
+            mer.data[i + 3] = data[i + 3];
         }
     }
     nctx.putImageData(normal, 0, 0);
-    rctx.putImageData(roughness, 0, 0);
-    mctx.putImageData(metallic, 0, 0);
+    mctx.putImageData(mer, 0, 0);
     return [
         makeTextureFromCanvas('3D DP Normal', normalCanvas, 'normal'),
-        makeTextureFromCanvas('3D DP Roughness', roughnessCanvas, 'mer'),
-        makeTextureFromCanvas('3D DP Metallic', metallicCanvas, 'mer'),
+        makeTextureFromCanvas('3D DP MER (Metallic/Emissive/Roughness)', merCanvas, 'mer'),
     ];
 }
 
@@ -324,15 +320,17 @@ function prepareDepthMaps(includePBR) {
         if (plugin) {
             plugin.depth_texture = depthTexture;
             plugin.source_texture = source.texture;
+            plugin.pbr_textures = [];
         }
         const created = ['depth scale'];
         if (includePBR) {
             const pbrMaps = createPBRMaps(width, height, data);
             if (plugin) plugin.pbr_textures = pbrMaps;
-            created.push('normal', 'roughness', 'metallic');
+            created.push('normal', 'packed MER (metallic/emissive/roughness)');
         }
-        Texture.selected = depthTexture;
-        Blockbench.showQuickMessage(`3D DP: created ${created.join(', ')}. The original texture remains the color texture.`);
+        // Keep the original color texture selected so the workflow naturally switches back to it.
+        Texture.selected = source.texture;
+        Blockbench.showQuickMessage(`3D DP: created ${created.join(', ')}. Original texture remains the color texture and the grayscale depth scale is stored for generation.`);
     } catch (error) {
         console.error('[3D DP] Map generation failed:', error);
         showError(`3D DP could not create the maps: ${error.message || error}`);
@@ -341,9 +339,7 @@ function prepareDepthMaps(includePBR) {
 
 function getDepthTextureForGeneration(sourceTexture, useGeneratedDepth) {
     const plugin = getPlugin();
-    if (useGeneratedDepth && plugin && plugin.depth_texture && plugin.source_texture === sourceTexture) {
-        return plugin.depth_texture;
-    }
+    if (useGeneratedDepth && plugin && plugin.depth_texture && plugin.source_texture === sourceTexture) return plugin.depth_texture;
     return null;
 }
 
@@ -435,7 +431,7 @@ function createParallax(maxOutward, maxInward, useGeneratedDepth) {
         const disabled = optimizeHiddenFaces(cubes);
         group.select();
         Undo.finishEdit('Generate 3D Depth Parallax', { outliner: true, elements: true, selection: true });
-        Blockbench.showQuickMessage(`3D DP: generated ${cubes.length} pixel layers, removed ${disabled} hidden faces, using ${useGeneratedDepth && depthTexture ? 'the generated grayscale depth scale' : 'live grayscale from the original texture'}. Original texture retained.`);
+        Blockbench.showQuickMessage(`3D DP: generated ${cubes.length} pixel layers, removed ${disabled} hidden faces, using ${useGeneratedDepth && depthTexture ? 'the stored grayscale depth scale' : 'live grayscale from the original texture'}. Original texture retained.`);
     } catch (error) {
         Undo.cancelEdit(true);
         if (group) group.remove();
@@ -466,7 +462,6 @@ function openDialog() {
             createParallax(outward, inward, Boolean(form.use_depth_scale));
         },
     });
-    const plugin = getPlugin();
     if (plugin) plugin.dialog = dialog;
     dialog.show();
 }
@@ -478,8 +473,8 @@ function openMapDialog() {
         title: '3D DP — Depth Scale & PBR Maps',
         width: isMobile() ? 360 : 430,
         form: {
-            pbr: { type: 'checkbox', label: 'Also create Normal, Roughness and Metallic maps', value: true },
-            info: { type: 'info', text: `Source: ${name}<br><br>This converts the source into a full 256-level grayscale depth scale using standard luminance. The map is used only to calculate physical depth; your original color texture stays on the model.` },
+            pbr: { type: 'checkbox', label: 'Also create Normal + packed MER maps', value: true },
+            info: { type: 'info', text: `Source: ${name}<br><br>3D DP converts the source to a full 256-level grayscale depth scale using Rec. 709 luminance. White is the maximum outward side of the scale, black is the maximum inward side, and middle gray is the base plane.<br><br>The depth map is stored for the generator. Your original color texture remains selected and is used on the final geometry.` },
         },
         onConfirm(form) {
             prepareDepthMaps(Boolean(form.pbr));
