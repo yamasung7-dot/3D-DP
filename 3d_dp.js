@@ -1,29 +1,38 @@
 BBPlugin.register('3d_dp', {
     title: '3D DP',
     author: 'Yama Sung',
-    description: 'Creates physical layered pixel parallax geometry from a texture or selected base cube.',
-    version: '0.1.0',
-    variant: 'desktop',
+    description: 'Creates physical layered depth parallax geometry from textures or selected base cubes, for Minecraft and generic Blockbench models.',
+    version: '0.2.0',
+    variant: 'both',
+    min_version: '4.10.0',
 
     onload() {
-        this.action = new Action('3d_dp_generate', {
-            name: 'Generate 3D Depth Parallax',
-            description: 'Generate physical layered parallax geometry from a texture or selected base cube.',
-            icon: 'view_in_ar',
-            category: 'edit',
-            click: () => openDialog(),
-        });
+        try {
+            this.action = new Action('3d_dp_generate', {
+                name: 'Generate 3D Depth Parallax',
+                description: 'Generate physical layered parallax geometry from a texture or selected base cube.',
+                icon: 'view_in_ar',
+                category: 'edit',
+                click: () => safeOpenDialog(),
+            });
+        } catch (error) {
+            console.error('[3D DP] Failed to create action:', error);
+        }
         this.dialog = null;
     },
 
     onunload() {
-        if (this.dialog) {
-            this.dialog.delete();
-            this.dialog = null;
-        }
-        if (this.action) {
-            this.action.delete();
-            this.action = null;
+        try {
+            if (this.dialog) {
+                this.dialog.delete();
+                this.dialog = null;
+            }
+            if (this.action) {
+                this.action.delete();
+                this.action = null;
+            }
+        } catch (error) {
+            console.error('[3D DP] Failed during unload:', error);
         }
     },
 
@@ -34,9 +43,34 @@ BBPlugin.register('3d_dp', {
 const DIRECTIONS = ['north', 'south', 'east', 'west', 'up', 'down'];
 const EPSILON = 1e-6;
 const SURFACE_THICKNESS = 0.01;
+const MOBILE_MAX_CUBES = 4096;
+const DESKTOP_MAX_CUBES = 16384;
 
 function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
+}
+
+function isMobile() {
+    return Boolean(typeof Blockbench !== 'undefined' && Blockbench.isMobile);
+}
+
+function getCubeLimit() {
+    return isMobile() ? MOBILE_MAX_CUBES : DESKTOP_MAX_CUBES;
+}
+
+function safeOpenDialog() {
+    try {
+        openDialog();
+    } catch (error) {
+        console.error('[3D DP] Dialog error:', error);
+        if (typeof Blockbench !== 'undefined' && Blockbench.showMessageBox) {
+            Blockbench.showMessageBox({
+                title: '3D DP',
+                message: '3D DP could not open its tool window. The plugin is still loaded safely. Please reload the plugin and try again.',
+                icon: 'error',
+            });
+        }
+    }
 }
 
 function getSelectedBaseCube() {
@@ -89,7 +123,7 @@ function getDepthFromPixel(r, g, b, maxOutward, maxInward) {
 }
 
 function makeUV(u, v) {
-    // Every face samples the same source texel, so added depth does not sample or warp neighboring pixels.
+    // Each face samples its source texel rather than the whole texture.
     return [u, v, u + 1, v + 1];
 }
 
@@ -102,7 +136,7 @@ function makePixelCube(x, y, zFrom, zTo, cellW, cellH, uvX, uvY, texture, group,
     const faces = {};
     for (const direction of DIRECTIONS) {
         faces[direction] = {
-            uv: uvs,
+            uv: [...uvs],
             texture,
             rotation: 0,
             enabled: true,
@@ -175,7 +209,48 @@ function optimizeHiddenFaces(cubes) {
     return disabled;
 }
 
-function createParallax(maxOutward, maxInward) {
+function createDepthHeightMap(width, height, data, maxOutward, maxInward) {
+    if (typeof Texture !== 'function') return null;
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+
+    const output = ctx.createImageData(width, height);
+    const maxDepth = Math.max(1, maxOutward, maxInward);
+    for (let py = 0; py < height; py++) {
+        for (let px = 0; px < width; px++) {
+            const i = (py * width + px) * 4;
+            const r = data[i];
+            const g = data[i + 1];
+            const b = data[i + 2];
+            const a = data[i + 3];
+            const depth = getDepthFromPixel(r, g, b, maxOutward, maxInward);
+            const normalized = clamp((depth + maxDepth) / (maxDepth * 2), 0, 1);
+            const value = Math.round(normalized * 255);
+            output.data[i] = value;
+            output.data[i + 1] = value;
+            output.data[i + 2] = value;
+            output.data[i + 3] = a;
+        }
+    }
+    ctx.putImageData(output, 0, 0);
+
+    const heightTexture = new Texture({
+        name: '3D DP Depth Height',
+        width,
+        height,
+        uv_width: width,
+        uv_height: height,
+    });
+    heightTexture.fromDataURL(canvas.toDataURL('image/png')).add();
+    heightTexture.pbr_channel = 'height';
+    heightTexture.render_mode = 'default';
+    return heightTexture;
+}
+
+function createParallax(maxOutward, maxInward, storeHeightMap) {
     const baseCube = getSelectedBaseCube();
     const source = getSourceTexture(baseCube);
     if (!source) {
@@ -198,6 +273,24 @@ function createParallax(maxOutward, maxInward) {
     }
 
     const { width, height, data } = pixelData;
+    const cubeLimit = getCubeLimit();
+    const opaquePixels = [];
+    for (let py = 0; py < height; py++) {
+        for (let px = 0; px < width; px++) {
+            const alpha = data[((py * width + px) * 4) + 3];
+            if (alpha !== 0) opaquePixels.push([px, py]);
+        }
+    }
+
+    if (opaquePixels.length > cubeLimit) {
+        Blockbench.showMessageBox({
+            title: '3D DP — Safety Limit',
+            message: `${isMobile() ? 'Mobile' : 'Desktop'} safety limit: this texture would create ${opaquePixels.length} pixel cubes, but the current limit is ${cubeLimit}. Use a smaller texture or a texture with more transparency. No geometry was created.`,
+            icon: 'warning',
+        });
+        return;
+    }
+
     let originX = 0;
     let originY = 0;
     let baseZ = 0;
@@ -218,10 +311,10 @@ function createParallax(maxOutward, maxInward) {
         baseZ = 0;
     }
 
-    // Start undo tracking before mutating the model.
     Undo.initEdit({ outliner: true, elements: true, selection: true });
 
     let group = null;
+    let heightTexture = null;
     try {
         group = new Group({
             name: '3D DP Parallax',
@@ -234,43 +327,42 @@ function createParallax(maxOutward, maxInward) {
         }).init().addTo('root');
 
         if (baseCube && source.direction === 'north') {
-            // The generated physical shell replaces the original textured north face.
             baseCube.faces.north.enabled = false;
         }
 
         const cubes = [];
         const textureRef = source.texture.uuid || source.texture.id;
 
-        for (let py = 0; py < height; py++) {
-            for (let px = 0; px < width; px++) {
-                const i = (py * width + px) * 4;
-                const r = data[i];
-                const g = data[i + 1];
-                const b = data[i + 2];
-                const a = data[i + 3];
-                if (a === 0) continue;
+        for (const [px, py] of opaquePixels) {
+            const i = (py * width + px) * 4;
+            const depth = getDepthFromPixel(data[i], data[i + 1], data[i + 2], maxOutward, maxInward);
+            const z0 = baseZ - Math.max(depth, 0);
+            const z1 = baseZ + Math.max(-depth, 0);
+            const x = originX + (px * cellW);
+            const y = originY + (py * cellH);
 
-                const depth = getDepthFromPixel(r, g, b, maxOutward, maxInward);
-                const z0 = baseZ - Math.max(depth, 0);
-                const z1 = baseZ + Math.max(-depth, 0);
-                const x = originX + (px * cellW);
-                const y = originY + (py * cellH);
-
-                const cube = makePixelCube(
-                    x, y, z0, z1, cellW, cellH, px, py,
-                    textureRef, group, `px_${px}_${py}`,
-                );
-                cubes.push({ cube, key: `${px},${py}` });
-            }
+            const cube = makePixelCube(
+                x, y, z0, z1, cellW, cellH, px, py,
+                textureRef, group, `px_${px}_${py}`,
+            );
+            cubes.push({ cube, key: `${px},${py}` });
         }
 
         const disabled = optimizeHiddenFaces(cubes);
+
+        if (storeHeightMap) {
+            heightTexture = createDepthHeightMap(width, height, data, maxOutward, maxInward);
+        }
+
         group.select();
         Undo.finishEdit('Generate 3D Depth Parallax', { outliner: true, elements: true, selection: true });
-        Blockbench.showQuickMessage(`3D DP: generated ${cubes.length} pixel layers, removed ${disabled} hidden faces.`);
+        Blockbench.showQuickMessage(
+            `3D DP: generated ${cubes.length} pixel layers, removed ${disabled} hidden faces${heightTexture ? ', stored a PBR height map' : ''}.`,
+        );
     } catch (error) {
         Undo.cancelEdit(true);
         if (group) group.remove();
+        if (heightTexture && heightTexture.remove) heightTexture.remove(true);
         console.error('[3D DP]', error);
         Blockbench.showMessageBox({
             title: '3D DP Error',
@@ -284,6 +376,9 @@ function openDialog() {
     const baseCube = getSelectedBaseCube();
     const source = getSourceTexture(baseCube);
     const selectedTextureName = source && source.texture ? source.texture.name : 'No texture selected';
+    const mobileText = isMobile()
+        ? `Android/mobile safety limit: ${MOBILE_MAX_CUBES} pixel cubes per operation.`
+        : `Desktop safety limit: ${DESKTOP_MAX_CUBES} pixel cubes per operation.`;
 
     const dialog = new Dialog('3d_dp_dialog', {
         title: '3D DP — Physical Layered Parallax',
@@ -305,15 +400,20 @@ function openDialog() {
                 max: 16,
                 step: 1,
             },
+            store_height: {
+                type: 'checkbox',
+                label: 'Store depth as PBR height map',
+                value: true,
+            },
             source_info: {
                 type: 'info',
-                text: `Source: ${selectedTextureName}`,
+                text: `Source: ${selectedTextureName}<br>${mobileText}<br>Works with Minecraft and Generic Model projects.`,
             },
         },
         onConfirm(form) {
             const outward = clamp(Math.round(Number(form.max_outward) || 0), 0, 16);
             const inward = clamp(Math.round(Number(form.max_inward) || 0), 0, 16);
-            createParallax(outward, inward);
+            createParallax(outward, inward, Boolean(form.store_height));
         },
     });
 
